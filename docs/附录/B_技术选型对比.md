@@ -199,32 +199,182 @@ controller: "RegulatedPurePursuit"  # 跟踪控制器
 
 ---
 
-## 5. 数据库方案对比
+## 5. 数据存储架构
 
-| 数据库 | 类型 | 性能 | 复杂度 | 是否选择 |
-|--------|------|------|--------|---------|
-| **SQLite** | **嵌入式** | **中** | **低** | ✅ **选择** |
-| MySQL | 客户端-服务器 | 高 | 中 | ❌ 过于复杂 |
-| PostgreSQL | 客户端-服务器 | 高 | 高 | ❌ 过于复杂 |
-| MongoDB | NoSQL | 高 | 中 | ❌ 不适合结构化数据 |
+### 5.1 数据分类与存储策略
 
-**选择**: **SQLite**
+本项目采用**混合存储架构**，针对不同类型数据选择最适合的存储方案：
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    数据存储架构                          │
+├─────────────────────────────────────────────────────────┤
+│                                                          │
+│  ┌────────────┐      ┌────────────┐      ┌───────────┐ │
+│  │  SQLite3   │      │   MySQL    │      │ InfluxDB  │ │
+│  │  (嵌入式)   │      │  (关系型)   │      │  (时序)   │ │
+│  └────────────┘      └────────────┘      └───────────┘ │
+│       ▲                   ▲                    ▲        │
+│       │                   │                    │        │
+│  ROS Bag数据          业务数据              实时监控数据   │
+│  • 激光雷达           • 作业记录            • CPU/内存    │
+│  • 相机图像           • 缺陷档案            • 温度/湿度    │
+│  • IMU数据            • 厚度检测            • 位置/速度    │
+│  • 导航路径           • 用户权限            • WIFI信号    │
+│                                                          │
+│  特点：               特点：                特点：        │
+│  • 临时存储(1周)      • 永久存储            • 自动降采样   │
+│  • 本地访问           • 远程访问            • 高频写入    │
+│  • 便于传输           • 复杂查询            • 实时面板    │
+└─────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 5.2 SQLite3 - ROS Bag存储
+
+**用途**: ROS2传感器数据录制（rosbag2默认后端）
+
+**优点**:
+- ROS2原生支持，零配置
+- 单文件存储，便于归档和传输
+- 本地读写性能高
+- 不需要数据库服务进程
+
+**存储内容**:
+- 激光雷达点云（/scan, 10Hz）
+- 相机图像（/camera/image, 30fps）
+- IMU数据（/imu, 100Hz）
+- 导航路径（/nav/path, 1Hz）
+
+**数据管理**:
+- 保留周期：7天（定期清理旧bag）
+- 单个bag大小：~2GB（录制30分钟）
+- 存储路径：`/data/rosbags/YYYY-MM-DD_HH-MM-SS.db3`
+
+**不涉及业务表设计** ✅
+
+---
+
+### 5.3 MySQL - 业务数据管理
+
+**用途**: 作业记录、缺陷档案、厚度检测等结构化业务数据
+
+| 对比项 | MySQL | PostgreSQL | MongoDB |
+|--------|-------|-----------|---------|
+| **成熟度** | 非常成熟 | 成熟 | 成熟 |
+| **性能** | 高（读优化） | 高（写优化） | 高 |
+| **复杂查询** | 优秀 | 优秀 | 弱 |
+| **远程访问** | 原生支持 | 原生支持 | 原生支持 |
+| **学习曲线** | 平缓 | 稍陡 | 中等 |
+| **是否选择** | ✅ **选择** | ❌ 功能过强 | ❌ 不适合结构化数据 |
+
+**选择**: **MySQL 8.0** ✅
 
 **理由**:
-1. **零配置**: 单文件数据库，无需安装服务
-2. **轻量级**: 适合嵌入式工控机
-3. **ACID保证**: 数据可靠性
-4. **ROS2集成简单**: Python/C++直接调用
+1. **远程访问**: 办公室电脑可查询现场作业数据
+2. **复杂查询**: 支持JOIN、子查询、视图、存储过程
+3. **数据分析**: 可对接BI工具（缺陷统计、作业效率分析）
+4. **生态成熟**: 工具链完善（Navicat、phpMyAdmin、Grafana）
+5. **成本低**: 开源免费，社区版功能完整
+
+**核心表设计**（详细设计见接口文档）:
+
+```sql
+-- 作业记录表
+CREATE TABLE jobs (
+    job_id INT PRIMARY KEY AUTO_INCREMENT,
+    start_time DATETIME,
+    end_time DATETIME,
+    work_area VARCHAR(50),  -- 侧墙/底板
+    operator VARCHAR(50),
+    status ENUM('in_progress', 'completed', 'failed')
+);
+
+-- 缺陷数据表
+CREATE TABLE defects (
+    defect_id INT PRIMARY KEY AUTO_INCREMENT,
+    job_id INT,
+    detect_time DATETIME,
+    position_x FLOAT,
+    position_y FLOAT,
+    defect_type VARCHAR(50),  -- 裂缝/孔洞/破损
+    size_mm FLOAT,
+    image_path VARCHAR(255),
+    repair_status ENUM('pending', 'repaired', 'ignored'),
+    FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+);
+
+-- 厚度检测表
+CREATE TABLE thickness_data (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    job_id INT,
+    measure_time DATETIME,
+    position_x FLOAT,
+    position_y FLOAT,
+    thickness_mm FLOAT,
+    is_qualified BOOLEAN,
+    FOREIGN KEY (job_id) REFERENCES jobs(job_id)
+);
+
+-- 用户权限表
+CREATE TABLE users (
+    user_id INT PRIMARY KEY AUTO_INCREMENT,
+    username VARCHAR(50) UNIQUE,
+    password_hash VARCHAR(255),
+    role ENUM('admin', 'operator', 'viewer')
+);
+```
+
+**部署方案**:
+- 容器化部署：Docker MySQL 8.0
+- 数据持久化：挂载 `/data/mysql` 到宿主机
+- 网络访问：`3306`端口（内网开放）
+
+---
+
+### 5.4 InfluxDB - 实时监控数据（可选）
+
+**用途**: 高频时序数据采集与监控
+
+**为什么需要InfluxDB**:
+- MySQL/SQLite **不擅长时序数据**：
+  - 无自动降采样（需手动删除旧数据）
+  - 时间范围查询性能差
+  - 无聚合函数（平均值、最大值需要手写SQL）
 
 **适用场景**:
-- 作业记录存储
-- 缺陷数据记录
-- 厚度检测数据
-- 系统配置
+- 系统性能监控（CPU、内存、温度）
+- 机器人实时状态（位置、速度、电压）
+- 环境数据（温湿度、WIFI信号强度）
 
-**不适合**:
-- 高并发写入（本项目无此需求）
-- 大规模数据分析（可导出到MySQL分析）
+**核心优势**:
+1. **高吞吐写入**: 百万级points/秒
+2. **自动降采样**: 1秒数据保留1周，1分钟数据保留1年
+3. **时间查询语法**: `SELECT * FROM cpu WHERE time > now() - 1h`
+4. **Grafana集成**: 一键配置实时监控面板
+
+**部署方案**（可选）:
+- 容器化：Docker InfluxDB 2.x
+- 数据源：ROS2节点定期发布系统指标
+- 可视化：Grafana实时面板
+
+**优先级**: ⚠️ **中等**（锦上添花，非核心功能）
+
+---
+
+### 5.5 存储架构总结
+
+| 数据库 | 是否必须 | 用途 | 增加工作量 | 备注 |
+|--------|---------|------|-----------|------|
+| **SQLite3** | ✅ 必须 | ROS bag录制 | 0（ROS2自带） | 无需表设计 |
+| **MySQL** | ✅ **强烈建议** | 业务数据管理 | +3天 | 需要表设计 |
+| **InfluxDB** | ⚠️ 可选 | 实时监控 | +2天 | 视预算和时间 |
+
+**最终建议**:
+1. SQLite（必须）+ MySQL（强烈建议）作为**基础架构**
+2. InfluxDB作为**增强功能**，如有时间和预算可实施
+3. MySQL是刚需：远程查询缺陷报告、作业统计是业务必需功能
 
 ---
 
@@ -348,7 +498,12 @@ controller: "RegulatedPurePursuit"  # 跟踪控制器
 └── AI检测: YOLO v12
 
 通信方案: WIFI6 (主) + 4G/5G (备)
-数据库: SQLite
+
+数据存储:
+├── SQLite3: ROS bag录制（必须）
+├── MySQL 8.0: 业务数据管理（强烈建议）
+└── InfluxDB 2.x: 实时监控（可选）
+
 开发工具: VS Code + GDB + RViz2
 ```
 
